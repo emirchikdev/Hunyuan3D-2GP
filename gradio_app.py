@@ -94,6 +94,39 @@ def open_browser_when_ready(host: str, port: int, path: str = "/", delay: float 
     threading.Timer(delay, _open).start()
 
 
+# Код выхода, с которым процесс завершается, когда пользователь сам нажал
+# кнопку "Закрыть" и подтвердил выход. Используется в .bat-скрипте, чтобы
+# отличить "пользователь сам вышел" от настоящей ошибки, и в этом случае
+# закрыть окно консоли автоматически, без "Нажмите любую клавишу...".
+SHUTDOWN_EXIT_CODE = 42
+
+
+def schedule_shutdown(delay: float = 8.0):
+    """
+    Планирует полное завершение процесса через `delay` секунд.
+
+    Вызывается из обработчика POST /shutdown, когда пользователь в браузере
+    нажал кнопку "Закрыть" и подтвердил выход во всплывающем окне confirm().
+    Вкладка браузера при этом закрывается сразу же на стороне клиента (см.
+    JS у кнопки exit_btn в build_app()), а сам процесс/сервер специально
+    выключается с небольшой задержкой - чтобы ответ на fetch('/shutdown')
+    успел долететь до браузера, прежде чем сервер перестанет отвечать.
+
+    os._exit() выбран вместо обычного sys.exit()/поднятия сигнала на
+    остановку uvicorn, потому что это самый надёжный способ гарантированно
+    убить процесс сразу, не дожидаясь штатного graceful shutdown - здесь он
+    не нужен, так как пользователь уже явно попрощался с приложением.
+    """
+
+    def _shutdown():
+        print(f"[shutdown] Пользователь подтвердил выход. Завершение через {delay:.0f} сек...")
+        time.sleep(delay)
+        print("[shutdown] Завершаю процесс.")
+        os._exit(SHUTDOWN_EXIT_CODE)
+
+    threading.Thread(target=_shutdown, daemon=True).start()
+
+
 # Применяем патч сразу при импорте модуля - до того, как что-либо в hy3dgen
 # успеет вызвать DiffusionPipeline.from_pretrained().
 patch_trust_remote_code()
@@ -456,9 +489,27 @@ def build_app():
         width: 20px;
     }
 
+    #hy3d-exit-btn {
+        position: fixed !important;
+        top: 10px;
+        right: 16px;
+        z-index: 10000;
+        width: auto !important;
+        min-width: 0 !important;
+        padding: 4px 14px !important;
+        background: #e11d48 !important;
+        border-color: #e11d48 !important;
+        color: #fff !important;
+    }
+    #hy3d-exit-btn:hover {
+        background: #be123c !important;
+        border-color: #be123c !important;
+    }
+
     """
 
     with gr.Blocks(theme=gr.themes.Base(), title='Hunyuan-3D-2.0', analytics_enabled=False, css=custom_css) as demo:
+        exit_btn = gr.Button("✕ Закрыть", elem_id="hy3d-exit-btn", size="sm")
         gr.HTML(title_html)
 
         with gr.Row():
@@ -708,6 +759,37 @@ def build_app():
             outputs=[html_export_mesh, file_export]
         )
 
+        # Кнопка "Закрыть": спрашиваем подтверждение через confirm() (не alert() -
+        # у alert() есть только кнопка "ОК", а нам нужен выбор да/нет). Если
+        # пользователь подтвердил - шлём на сервер POST /shutdown (он через 8 секунд
+        # завершит процесс, см. schedule_shutdown()) и сразу пробуем закрыть вкладку.
+        #
+        # Важно: браузеры по соображениям безопасности разрешают window.close()
+        # только для вкладок, открытых самим скриптом через window.open() - а эта
+        # вкладка была открыта автоматически через webbrowser.open() на стороне
+        # Python, а не через JS. Поэтому window.close() может не сработать (браузер
+        # просто проигнорирует вызов, без ошибки) - на этот случай показываем
+        # заглушку "приложение закрыто, вкладку можно закрыть вручную".
+        exit_btn.click(
+            fn=None,
+            inputs=[],
+            outputs=[],
+            js="""
+            () => {
+                if (confirm("Вы действительно хотите выйти?")) {
+                    fetch('/shutdown', {method: 'POST'}).catch(() => {});
+                    window.close();
+                    setTimeout(() => {
+                        document.body.innerHTML =
+                            '<div style="display:flex;align-items:center;justify-content:center;' +
+                            'height:100vh;font-family:sans-serif;font-size:20px;color:#555;">' +
+                            'Приложение закрыто. Эту вкладку можно закрыть.</div>';
+                    }, 300);
+                }
+            }
+            """
+        )
+
     return demo
 
 def replace_property_getter(instance, property_name, new_getter):
@@ -886,6 +968,16 @@ if __name__ == '__main__':
     static_dir.mkdir(parents=True, exist_ok=True)
     app.mount("/static", StaticFiles(directory=static_dir, html=True), name="static")
     shutil.copytree('./assets/env_maps', os.path.join(static_dir, 'env_maps'), dirs_exist_ok=True)
+
+    # Эндпоинт для кнопки "Закрыть" в интерфейсе. Регистрируем его до
+    # gr.mount_gradio_app(app, demo, path="/") - Starlette проверяет маршруты
+    # в порядке добавления, и если бы мы добавили этот route после монтирования
+    # Gradio на "/", запрос POST /shutdown мог бы быть перехвачен монтированным
+    # приложением раньше, чем дойдёт до этого обработчика.
+    @app.post("/shutdown")
+    async def _shutdown_endpoint():
+        schedule_shutdown(delay=8.0)
+        return {"status": "ok", "message": "Сервер завершится через 8 секунд."}
 
     if args.low_vram_mode:
         torch.cuda.empty_cache()
