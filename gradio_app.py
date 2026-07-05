@@ -15,7 +15,9 @@
 import os
 import random
 import shutil
+import threading
 import time
+import webbrowser
 from glob import glob
 from pathlib import Path
 
@@ -31,6 +33,70 @@ import uuid
 from hy3dgen.shapegen.utils import logger
 
 MAX_SEED = 1e7
+
+
+def patch_trust_remote_code():
+    """
+    Некоторые модели (мультиракурсная и delight-диффузионные модели внутри
+    Hunyuan3DPaintPipeline, а также HunyuanDiT) выложены на HF Hub с кастомным
+    кодом инференса и без trust_remote_code=True при загрузке падают с ошибкой.
+
+    Раньше это лечилось костылём - отдельным скриптом patch_trust_remote_code.ps1,
+    который открывал файл библиотеки на диске, находил в нём текст вида
+    `DiffusionPipeline.from_pretrained(...)` и дописывал туда `trust_remote_code=True`
+    через regex. Минусы такого подхода: скрипт нужно было запускать вручную
+    после каждой переустановки/обновления зависимостей, а если текст вызова в
+    файле хоть немного менялся между версиями библиотеки - патч тихо переставал
+    находить нужное место и просто не срабатывал.
+
+    Вместо редактирования файлов на диске подменяем сам метод в рантайме:
+    у базового класса DiffusionPipeline подменяется classmethod from_pretrained
+    на обёртку, которая по умолчанию (если явно не указано иное) передаёт
+    trust_remote_code=True. Поскольку from_pretrained ищется Python-ом по MRO
+    в момент вызова, обёртка сработает для любого кода в hy3dgen (и его
+    зависимостях), который вызывает `DiffusionPipeline.from_pretrained(...)`
+    или наследует этот метод, не переопределяя его - независимо от того, в
+    каком файле и в какой версии библиотеки находится сам вызов.
+    """
+    from diffusers import DiffusionPipeline
+
+    if getattr(DiffusionPipeline.from_pretrained, "_hy3d_trust_remote_code_patched", False):
+        return
+
+    original_from_pretrained = DiffusionPipeline.from_pretrained.__func__
+
+    @classmethod
+    def patched_from_pretrained(cls, *args, **kwargs):
+        kwargs.setdefault("trust_remote_code", True)
+        return original_from_pretrained(cls, *args, **kwargs)
+
+    patched_from_pretrained._hy3d_trust_remote_code_patched = True
+    DiffusionPipeline.from_pretrained = patched_from_pretrained
+    print("[patch] DiffusionPipeline.from_pretrained пропатчен: trust_remote_code=True по умолчанию")
+
+
+def open_browser_when_ready(host: str, port: int, path: str = "/", delay: float = 1.0):
+    """
+    Автоматически открывает браузер на адресе запущенного Gradio/FastAPI сервера.
+
+    host может быть '0.0.0.0' (сервер слушает все интерфейсы) - в браузере такой
+    адрес не открыть, поэтому для перехода подставляем 127.0.0.1.
+    Небольшая задержка перед открытием - подстраховка на случай, если сокет
+    ещё не до конца готов принимать соединения в момент срабатывания события.
+    """
+    browser_host = "127.0.0.1" if host in ("0.0.0.0", "", None) else host
+    url = f"http://{browser_host}:{port}{path}"
+
+    def _open():
+        print(f"[browser] Открываю {url}")
+        webbrowser.open(url)
+
+    threading.Timer(delay, _open).start()
+
+
+# Применяем патч сразу при импорте модуля - до того, как что-либо в hy3dgen
+# успеет вызвать DiffusionPipeline.from_pretrained().
+patch_trust_remote_code()
 
 
 def get_example_img_list():
@@ -300,70 +366,6 @@ def generation_all(
                                                          textured=True)
     if args.low_vram_mode:
         torch.cuda.empty_cache()
-    return (
-        gr.update(value=path),
-        gr.update(value=path_textured),
-        model_viewer_html_textured,
-        stats,
-        seed,
-    )
-
-
-def shape_generation(
-    caption=None,
-    image=None,
-    mv_image_front=None,
-    mv_image_back=None,
-    mv_image_left=None,
-    mv_image_right=None,
-    steps=50,
-    guidance_scale=7.5,
-    seed=1234,
-    octree_resolution=256,
-    check_box_rembg=False,
-    num_chunks=200000,
-    randomize_seed: bool = False,
-):
-    start_time_0 = time.time()
-    mesh, image, save_folder, stats, seed = _gen_shape(
-        caption,
-        image,
-        mv_image_front=mv_image_front,
-        mv_image_back=mv_image_back,
-        mv_image_left=mv_image_left,
-        mv_image_right=mv_image_right,
-        steps=steps,
-        guidance_scale=guidance_scale,
-        seed=seed,
-        octree_resolution=octree_resolution,
-        check_box_rembg=check_box_rembg,
-        num_chunks=num_chunks,
-        randomize_seed=randomize_seed,
-    )
-    path = export_mesh(mesh, save_folder, textured=False)
-
-    # tmp_time = time.time()
-    # mesh = floater_remove_worker(mesh)
-    # mesh = degenerate_face_remove_worker(mesh)
-    # logger.info("---Postprocessing takes %s seconds ---" % (time.time() - tmp_time))
-    # stats['time']['postprocessing'] = time.time() - tmp_time
-
-    tmp_time = time.time()
-    mesh = face_reduce_worker(mesh)
-    logger.info("---Face Reduction takes %s seconds ---" % (time.time() - tmp_time))
-    stats['time']['face reduction'] = time.time() - tmp_time
-
-    tmp_time = time.time()
-    textured_mesh = texgen_worker(mesh, image)
-    logger.info("---Texture Generation takes %s seconds ---" % (time.time() - tmp_time))
-    stats['time']['texture generation'] = time.time() - tmp_time
-    stats['time']['total'] = time.time() - start_time_0
-
-    textured_mesh.metadata['extras'] = stats
-    path_textured = export_mesh(textured_mesh, save_folder, textured=True)
-    model_viewer_html_textured = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH,
-                                                         textured=True)
-    torch.cuda.empty_cache()
     return (
         gr.update(value=path),
         gr.update(value=path_textured),
@@ -889,4 +891,13 @@ if __name__ == '__main__':
         torch.cuda.empty_cache()
     demo = build_app()
     app = gr.mount_gradio_app(app, demo, path="/")
+
+    # Автооткрытие браузера на localhost, как только сервер реально готов
+    # принимать запросы. Событие "startup" в FastAPI/Starlette срабатывает
+    # уже после того, как uvicorn забиндил сокет и запустил приложение - то
+    # есть ровно в тот момент, когда открывать страницу безопасно.
+    @app.on_event("startup")
+    async def _launch_browser_on_startup():
+        open_browser_when_ready(args.host, args.port)
+
     uvicorn.run(app, host=args.host, port=args.port, workers=1)
